@@ -2,7 +2,7 @@ seed: 4
 num_gpus: 1
 exp_name: 'lego'
 train:
-  batch_size: 3072
+  batch_size: 2048
   batch_type: 'all_images'  # single_image: inputs a full image; all_images: inputs batch_size rays sampled from different image
   num_work: 4
   randomized: True

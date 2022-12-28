@@ -2,7 +2,7 @@ import torch
 from einops import rearrange
 import numpy as np
 from datasets.datasets import Rays_keys, Rays
-#from functorch import jacrev, vmap
+from functorch import jacrev, vmap
 
 
 def distloss(weight, samples):
@@ -20,15 +20,27 @@ def distloss(weight, samples):
     return loss_uni + loss_bi
 
 def lift_gaussian(directions, t_mean, t_var, r_var, diagonal):
-    """Lift a Gaussian defined along a ray to 3D coordinates."""
+    """Lift a Gaussian defined along a ray to 3D coordinates.
+    
+    Args:
+        directions: [B, 3] 每个batch代表一根光线, 对应一个d.
+        t_mean: [B, N] 每个batch上有N个Sample, 对应一个t_mean.
+        t_var: [B, N] 同t_mean.
+        r_var: [B, N] 同t_mean.
+        diagonal: bool 判断是否只进行对角计算
+    Returns:
+        mean: [B, N, 3] 每个batch上有N个Sample, 每个Sample对应一个3D表示的均值光线
+        cov: [B, N, 3](diagonal=True) or [B, N, 3, 3](diagonal=False)
+            每个Sample对应的协方差矩阵3x3, 若diagonal=True, 只需要记录三个主对角线的值 
+    """
     mean = torch.unsqueeze(directions, dim=-2) * torch.unsqueeze(t_mean, dim=-1)  # [B, 1, 3]*[B, N, 1] = [B, N, 3]
-    d_norm_denominator = torch.sum(directions ** 2, dim=-1, keepdim=True) + 1e-10
+    d_norm_denominator = torch.sum(directions ** 2, dim=-1, keepdim=True) + 1e-10 # [B, 1]
     # min_denominator = torch.full_like(d_norm_denominator, 1e-10)
     # d_norm_denominator = torch.maximum(min_denominator, d_norm_denominator)
 
     if diagonal:
-        d_outer_diag = directions ** 2  # eq (16)
-        null_outer_diag = 1 - d_outer_diag / d_norm_denominator
+        d_outer_diag = directions ** 2  # eq (16) [B, 3]
+        null_outer_diag = 1 - d_outer_diag / d_norm_denominator # [B, 3]
         t_cov_diag = torch.unsqueeze(t_var, dim=-1) * torch.unsqueeze(d_outer_diag,
                                                                       dim=-2)  # [B, N, 1] * [B, 1, 3] = [B, N, 3]
         xy_cov_diag = torch.unsqueeze(r_var, dim=-1) * torch.unsqueeze(null_outer_diag, dim=-2)
@@ -36,10 +48,10 @@ def lift_gaussian(directions, t_mean, t_var, r_var, diagonal):
         return mean, cov_diag
     else:
         d_outer = torch.unsqueeze(directions, dim=-1) * torch.unsqueeze(directions,
-                                                                        dim=-2)  # [B, 3, 1] * [B, 1, 3] = [B, 3, 3]
+                                                                        dim=-2)  # dd^T [B, 3, 1] * [B, 1, 3] = [B, 3, 3]
         eye = torch.eye(directions.shape[-1], device=directions.device)  # [B, 3, 3]
         # [B, 3, 1] * ([B, 3] / [B, 1])[..., None, :] = [B, 3, 3]
-        null_outer = eye - torch.unsqueeze(directions, dim=-1) * (directions / d_norm_denominator).unsqueeze(-2)
+        null_outer = eye - torch.unsqueeze(directions, dim=-1) * (directions / d_norm_denominator).unsqueeze(-2) # [B, 3, 3] - [B, 3, 1]*[B, 1, 3]
         t_cov = t_var.unsqueeze(-1).unsqueeze(-1) * d_outer.unsqueeze(-3)  # [B, N, 1, 1] * [B, 1, 3, 3] = [B, N, 3, 3]
         xy_cov = t_var.unsqueeze(-1).unsqueeze(-1) * null_outer.unsqueeze(
             -3)  # [B, N, 1, 1] * [B, 1, 3, 3] = [B, N, 3, 3]
@@ -98,8 +110,8 @@ def cast_rays(t_samples, origins, directions, radii, ray_shape, diagonal=True):
         raise NotImplementedError
     else:
         assert False
-    means, covs = gaussian_fn(directions, t0, t1, radii, diagonal)
-    means = means + torch.unsqueeze(origins, dim=-2)
+    means, covs = gaussian_fn(directions, t0, t1, radii, diagonal) # [B, N, 3] [B, N, 3]or[B, N, 3, 3]
+    means = means + torch.unsqueeze(origins, dim=-2) # [B, N, 3]*[B, 1, 3] = [B, N, 3]
     return means, covs
 
 
@@ -138,9 +150,9 @@ def sample_along_rays(origins, directions, radii, num_samples, near, far, random
         disparity: bool, sampling linearly in disparity rather than depth.
         ray_shape: string, which shape ray to assume.
     Returns:
-    t_samples: torch.Tensor, [batch_size, num_samples], sampled z values.
-    means: torch.Tensor, [batch_size, num_samples, 3], sampled means.
-    covs: torch.Tensor, [batch_size, num_samples, 3, 3], sampled covariances.
+        t_samples: torch.Tensor, [batch_size, num_samples + 1], sampled z values.
+        means: torch.Tensor, [batch_size, num_samples, 3], sampled means.
+        covs: torch.Tensor, [batch_size, num_samples, 3, 3], sampled covariances.
     """
     batch_size = origins.shape[0]
 
@@ -178,6 +190,8 @@ def sorted_piecewise_constant_pdf(bins, weights, num_samples, randomized):
     """
     # Pad each weight vector (only if necessary) to bring its sum to `eps`. This
     # avoids NaNs when the input is zeros or small, but has no effect otherwise.
+    # 如果weight_sum > eps, padding = 0, weight_sum = weight_sum
+    # 如果weight_sum < eps, padding = eps - weight_sum, weight_sum = weight_sum + eps - weight_sum = eps.
     eps = 1e-5
     weight_sum = torch.sum(weights, dim=-1, keepdim=True)  # [B, 1]
     padding = torch.maximum(torch.zeros_like(weight_sum), eps - weight_sum)
@@ -198,6 +212,7 @@ def sorted_piecewise_constant_pdf(bins, weights, num_samples, randomized):
     if randomized:
         s = 1 / num_samples
         u = (torch.arange(num_samples, device=cdf.device) * s)[None, ...]
+        # 这里的uniform_是对u进行一个[0, s-eps]的扰动
         u = u + torch.empty(list(cdf.shape[:-1]) + [num_samples], device=cdf.device).uniform_(
             to=(s - torch.finfo(torch.float32).eps))
         # `u` is in [0, 1) --- it can be zero, but it can never be 1.
@@ -220,11 +235,14 @@ def sorted_piecewise_constant_pdf(bins, weights, num_samples, randomized):
     inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
 
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
-    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g) # [B, N, 2]
+    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g) # [B, N, 2]
     denom = (cdf_g[..., 1] - cdf_g[..., 0])
+    # 如果denom太小，就修改成1
     denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    # u是纵向均匀的采样值（有可能做过扰动）, 这里计算的是纵向的差值
     t = (u - cdf_g[..., 0]) / denom
+    # 通过相似关系映射到横向
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
     return samples
 
@@ -249,9 +267,9 @@ def resample_along_rays(origins, directions, radii, t_samples, weights, randomiz
     # Do a blurpool.
     if stop_grad:
         with torch.no_grad():
-            weights_pad = torch.cat([weights[..., :1], weights, weights[..., -1:]], dim=-1)
-            weights_max = torch.maximum(weights_pad[..., :-1], weights_pad[..., 1:])
-            weights_blur = 0.5 * (weights_max[..., :-1] + weights_max[..., 1:])
+            weights_pad = torch.cat([weights[..., :1], weights, weights[..., -1:]], dim=-1) # [B, N+2]
+            weights_max = torch.maximum(weights_pad[..., :-1], weights_pad[..., 1:]) # [B, N+1]
+            weights_blur = 0.5 * (weights_max[..., :-1] + weights_max[..., 1:]) # [B, N]
 
             # Add in a constant (the sampling function will renormalize the PDF).
             weights = weights_blur + resample_padding
@@ -345,6 +363,7 @@ def integrated_pos_enc(means_covs, min_deg, max_deg, diagonal=True):
         # [3, L]
         basis = torch.cat([2 ** i * torch.eye(num_dims, device=means.device) for i in range(min_deg, max_deg)], 1)
         y = torch.matmul(means, basis)  # [B, N, 3] * [3, 3L] = [B, N, 3L]
+        # [B, N, 3]*[3, 3L] = [B, N, 3,3L]; [B, N, 3, 3L]*[3, 3L] = [B, N, 3, 3L] -> [B, N, 1, 3L]
         y_var = torch.sum((torch.matmul(x_cov, basis)) * basis, -2)
     # sin(y + 0.5 * torch.tensor(np.pi)) = cos(y) 中国的学生脑子一定出现那句 “奇变偶不变 符号看象限”
     return expected_sin(torch.cat([y, y + 0.5 * torch.tensor(np.pi)], dim=-1), torch.cat([y_var] * 2, dim=-1))[0]
@@ -383,8 +402,9 @@ def volumetric_rendering(rgb, density, t_samples, dirs, white_bkgd):
     # the delta is norm(t1*d-t2*d) = (t1-t2)*norm(d)
     delta = t_interval * torch.linalg.norm(torch.unsqueeze(dirs, dim=-2), dim=-1)
     # Note that we're quietly turning density from [..., 0] to [...].
-    density_delta = density[..., 0] * delta
+    density_delta = density[..., 0] * delta # [B, N]
 
+    # 这种渲染计算相比于原版NeRF比较低效，因为重复计算了torch.exp(-density_delta)
     alpha = 1 - torch.exp(-density_delta)
     trans = torch.exp(-torch.cat([
         torch.zeros_like(density_delta[..., :1]),
